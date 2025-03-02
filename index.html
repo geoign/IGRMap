@@ -1,0 +1,778 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+	<meta charset="UTF-8">
+	<title>IGR Map by Ikegami GeoResearch</title>
+
+	<link rel="stylesheet" href="https://data.earth.jaxa.jp/api/javascript/v1.2.3/example/OpenLayers/ol_v10.1.0/ol.css" type="text/css">
+	<script src="https://data.earth.jaxa.jp/api/javascript/v1.2.3/example/OpenLayers/ol_v10.1.0/ol.js"></script>
+	<style>
+		#map {
+			width: 50%;
+			height: 800px;
+			border: solid 1px gray;
+			background-color: #ccc;
+			flex-shrink: 0;
+		}
+	</style>
+</head>
+<body>
+	<div style="font-size:x-small">Left Map: (C) Google. Right Map: <a href="https://x.com/geoign" target="_blank">Fumihiko Ikegami</a>. 2025. Some rights reserved. CC BY 4.0. The source data is provided by <a href="https://data.earth.jaxa.jp/" target="_blank">JAXA API</a>.</div>
+	<div style="font-size:x-small">使い方: 左の地図をスクロールすると遅れて右が描画されます。描画速度はお使いの端末とブラウザに依存します。</div>
+	<div style="display: flex; flex-direction: row; justify-content: space-between;">
+		<div id="map" style="width: 45%; height: 800px; border: 1px solid gray;"></div>
+		<canvas id="lowerMapCanvas" style="width:45%; height:800px; border: 1px solid gray;"></canvas>
+		<div id="shadowControl" style="width:10%; margin-top: 10px; text-align: left;">
+			<input type="radio" id="combined" name="shadowType" value="combined" checked>
+			<label for="combined">尾根谷度×陰影</label>
+			<br>
+			<input type="radio" id="hillshade" name="shadowType" value="hillshade">
+			<label for="hillshade">簡易陰影図</label>
+			<br>
+			<input type="radio" id="ambient" name="shadowType" value="ambient">
+			<label for="ambient">Ambient Occ</label>
+			<br>
+			<input type="radio" id="slope" name="shadowType" value="slope">
+			<label for="slope">傾斜量図</label>
+			<br>
+			<input type="radio" id="openness" name="shadowType" value="openness">
+			<label for="openness">地形開度</label>
+		</div>
+	</div>
+
+	<script type="module">
+
+		function calculateHillshade(dem, cellSize, sunAzimuth = 315, sunAltitude = 45) {
+			// 太陽高度から天頂角（zenith angle）を計算（ラジアン）
+			const radZenith = (90 - sunAltitude) * Math.PI / 180;
+			// 光源の方位は、通常、北を0°とし時計回りとするが、
+			// Hillshade計算では、ArcGIS等で用いられる調整として
+			// (360 - sunAzimuth + 90) % 360 を行い、ラジアンに変換する
+			const radSunAzimuth = ((360 - sunAzimuth + 90) % 360) * Math.PI / 180;
+
+			const rows = dem.length;
+			const cols = dem[0].length;
+			const hillshade = [];
+
+			// 結果用の2次元配列を初期化（境界は null とする）
+			for (let i = 0; i < rows; i++) {
+				hillshade[i] = new Array(cols).fill(null);
+			}
+
+			// 各セル（境界を除く）について陰影を計算
+			for (let i = 1; i < rows - 1; i++) {
+				for (let j = 1; j < cols - 1; j++) {
+				// 3×3の窓：以下のように配置
+				// z1 z2 z3
+				// z4 z5 z6
+				// z7 z8 z9
+				const z1 = dem[i - 1][j - 1];
+				const z2 = dem[i - 1][j];
+				const z3 = dem[i - 1][j + 1];
+				const z4 = dem[i][j - 1];
+				const z5 = dem[i][j];
+				const z6 = dem[i][j + 1];
+				const z7 = dem[i + 1][j - 1];
+				const z8 = dem[i + 1][j];
+				const z9 = dem[i + 1][j + 1];
+
+				// Hornの方法による傾斜勾配の計算
+				const dzdx = ((z3 + 2 * z6 + z9) - (z1 + 2 * z4 + z7)) / (8 * cellSize);
+				const dzdy = ((z7 + 2 * z8 + z9) - (z1 + 2 * z2 + z3)) / (8 * cellSize);
+
+				// 傾斜（slope：ラジアン）
+				const slope = Math.atan(Math.sqrt(dzdx * dzdx + dzdy * dzdy));
+
+				// 方位（aspect：ラジアン、北から時計回り）
+				let aspect = Math.atan2(dzdy, -dzdx);
+				if (aspect < 0) {
+					aspect += 2 * Math.PI;
+				}
+
+				// Lambertの余弦則に基づく陰影計算
+				const shade = Math.cos(radZenith) * Math.cos(slope) +
+								Math.sin(radZenith) * Math.sin(slope) * Math.cos(radSunAzimuth - aspect);
+				// 陰影値を 0～255 にスケール（負の値は 0 とする）
+				const hsValue = Math.max(0, Math.floor(255 * shade));
+				hillshade[i][j] = hsValue;
+				}
+			}
+
+			return hillshade;
+		}
+
+		// 傾斜量をもとめる関数
+		function calculateSlope(dem, cellSize) {
+			const rows = dem.length;
+			const cols = dem[0].length;
+			const slope = [];
+			
+			// 2次元配列の初期化
+			for (let i = 0; i < rows; i++) {
+				slope[i] = new Array(cols).fill(null);
+			}
+			
+			// 境界を除いた各セルについて計算
+			for (let i = 1; i < rows - 1; i++) {
+				for (let j = 1; j < cols - 1; j++) {
+				const z1 = dem[i - 1][j - 1];
+				const z2 = dem[i - 1][j];
+				const z3 = dem[i - 1][j + 1];
+				const z4 = dem[i][j - 1];
+				const z6 = dem[i][j + 1];
+				const z7 = dem[i + 1][j - 1];
+				const z8 = dem[i + 1][j];
+				const z9 = dem[i + 1][j + 1];
+				
+				const dzdx = ((z3 + 2 * z6 + z9) - (z1 + 2 * z4 + z7)) / (8 * cellSize);
+				const dzdy = ((z7 + 2 * z8 + z9) - (z1 + 2 * z2 + z3)) / (8 * cellSize);
+				
+				const grad = Math.sqrt(dzdx * dzdx + dzdy * dzdy);
+				// 傾斜角（ラジアン）を度に変換
+				slope[i][j] = Math.atan(grad) * (180 / Math.PI);
+				}
+			}
+			
+			return slope;
+		}
+
+		// Ambient Occlusionを求める関数
+		function calculateAmbientOcclusion(dem, cellSize, windowRadius = 1, numDirections = 8) {
+			const rows = dem.length;
+			const cols = dem[0].length;
+			const ao = [];
+			
+			// 結果用の2次元配列を初期化（境界は計算対象外とする）
+			for (let i = 0; i < rows; i++) {
+				ao[i] = new Array(cols).fill(null);
+			}
+			
+			// 境界を除いた各セルについて計算
+			for (let i = windowRadius; i < rows - windowRadius; i++) {
+				for (let j = windowRadius; j < cols - windowRadius; j++) {
+				const centerHeight = dem[i][j];
+				let totalMaxAngle = 0;
+				
+				// 指定した方向数（例：8方向）について最大遮蔽角度を求める
+				for (let d = 0; d < numDirections; d++) {
+					const theta = (2 * Math.PI * d) / numDirections;
+					let maxAngle = -Infinity;
+					
+					// 各方向に沿って、中心セルから windowRadius までレイを伸ばす
+					for (let step = 1; step <= windowRadius; step++) {
+					// 角度 theta に沿った隣接セルのインデックス（四捨五入して整数値）
+					const di = Math.round(i + step * Math.sin(theta));
+					const dj = Math.round(j + step * Math.cos(theta));
+					
+					// 配列範囲外の場合はその方向のサンプリングを中断
+					if (di < 0 || di >= rows || dj < 0 || dj >= cols) break;
+					
+					const distance = step * cellSize;  // セル間距離の近似
+					const heightDiff = dem[di][dj] - centerHeight;
+					// arctan2 を用いて、隣接セルとの相対的な角度（ラジアン）を計算
+					const angle = Math.atan2(heightDiff, distance);
+					
+					if (angle > maxAngle) {
+						maxAngle = angle;
+					}
+					}
+					
+					// もし有効な角度がなかった場合は 0 とする
+					if (maxAngle === -Infinity) maxAngle = 0;
+					totalMaxAngle += maxAngle;
+				}
+				
+				// 各方向での最大遮蔽角度の平均
+				const avgMaxAngle = totalMaxAngle / numDirections;
+				// AO値は、平均角度が大きいほど暗くなるように正規化
+				// 平均角度が 0 なら完全に露出（AO = 1）、π/2 なら完全遮蔽（AO = 0）
+				let occlusion = 1 - (avgMaxAngle / (Math.PI / 2));
+				// 結果を 0～1 の範囲にクランプ
+				occlusion = Math.max(0, Math.min(1, occlusion));
+				
+				ao[i][j] = occlusion;
+				}
+			}
+			
+			return ao;
+		}
+
+		// 地形開度を求める関数
+		function calculateTopographicOpenness(dem, cellSize, windowRadius = 1, numDirections = 8) {
+			const rows = dem.length;
+			const cols = dem[0].length;
+			
+			// 結果を保持する2次元配列（上半球・下半球）を初期化（境界は計算対象外）
+			const upperOpenness = [];
+			const lowerOpenness = [];
+			for (let i = 0; i < rows; i++) {
+				upperOpenness[i] = new Array(cols).fill(null);
+				lowerOpenness[i] = new Array(cols).fill(null);
+			}
+			
+			// 境界を除いた各セルについて計算
+			for (let i = windowRadius; i < rows - windowRadius; i++) {
+				for (let j = windowRadius; j < cols - windowRadius; j++) {
+				const centerHeight = dem[i][j];
+				let sumMaxAngle = 0;
+				let sumMinAngle = 0;
+				
+				// 指定した方向数（例：8方向）について処理
+				for (let d = 0; d < numDirections; d++) {
+					// 方向θ（ラジアン）
+					const theta = (2 * Math.PI * d) / numDirections;
+					let maxAngle = -Infinity;
+					let minAngle = Infinity;
+					
+					// 中心セルから windowRadius まで各方向に沿ってレイを伸ばす
+					for (let step = 1; step <= windowRadius; step++) {
+					// 方向θに沿ったセルのインデックス（近似的に四捨五入）
+					const di = Math.round(i + step * Math.sin(theta));
+					const dj = Math.round(j + step * Math.cos(theta));
+					
+					// 配列範囲外ならその方向でのサンプリングを終了
+					if (di < 0 || di >= rows || dj < 0 || dj >= cols) break;
+					
+					const distance = step * cellSize;  // セル間距離の近似
+					// 中心セルと対象セルとの標高差から角度（度単位）を計算
+					const angle = Math.atan2(dem[di][dj] - centerHeight, distance) * (180 / Math.PI);
+					
+					if (angle > maxAngle) maxAngle = angle;
+					if (angle < minAngle) minAngle = angle;
+					}
+					
+					// もし有効な値がなかった場合は 0 とする
+					if (maxAngle === -Infinity) maxAngle = 0;
+					if (minAngle === Infinity) minAngle = 0;
+					
+					sumMaxAngle += maxAngle;
+					sumMinAngle += minAngle;
+				}
+				
+				// 各方向での平均最大角度・最小角度
+				const avgMaxAngle = sumMaxAngle / numDirections;
+				const avgMinAngle = sumMinAngle / numDirections;
+				
+				// 正の（上方）地形開度：水平から見た視界の開け具合（大きいほど空に近い）
+				const posOpenness = 90 - avgMaxAngle;
+				// 負の（下方）地形開度：下方の地形に遮られる具合（大きいほど谷に近い）
+				const negOpenness = 90 + avgMinAngle;
+				
+				upperOpenness[i][j] = posOpenness;
+				lowerOpenness[i][j] = negOpenness;
+				}
+			}
+			
+			return { upper: upperOpenness, lower: lowerOpenness };
+		}
+
+		function calculateRidgeValleyDegreeFromOpenness(upper, lower) {
+			const rows = upper.length;
+			const cols = upper[0].length;
+			const rvd = [];
+
+			// 上下のマトリックスの大きさを前提に、結果用の2次元配列を初期化
+			for (let i = 0; i < rows; i++) {
+				rvd[i] = new Array(cols).fill(null);
+				for (let j = 0; j < cols; j++) {
+				// upperまたはlowerがnullの場合は結果もnullとする
+				if (upper[i][j] === null || lower[i][j] === null) {
+					rvd[i][j] = null;
+				} else {
+					// (upper - lower) / 2 の計算
+					rvd[i][j] = (upper[i][j] - lower[i][j]) / 2;
+				}
+				}
+			}
+			
+			return rvd;
+		}
+
+		function multiplyMatrices(matrixA, matrixB) {
+			const rowsA = matrixA.length;
+			const rowsB = matrixB.length;
+			
+			// 行数が一致しているかチェック
+			if (rowsA !== rowsB) {
+				throw new Error("行列Aと行列Bの行数が一致していません。");
+			}
+			
+			const colsA = matrixA[0].length;
+			const colsB = matrixB[0].length;
+			
+			// 列数が一致しているかチェック
+			if (colsA !== colsB) {
+				throw new Error("行列Aと行列Bの列数が一致していません。");
+			}
+			
+			const result = [];
+			for (let i = 0; i < rowsA; i++) {
+				result[i] = [];
+				for (let j = 0; j < colsA; j++) {
+				result[i][j] = matrixA[i][j] * matrixB[i][j];
+				}
+			}
+			
+			return result;
+		}
+
+		// 2次元配列を指定した解像度に再サンプリングする関数
+		function resampleMatrix(matrix, targetRows, targetCols) {
+			const sourceRows = matrix.length;
+			const sourceCols = matrix[0].length;
+			const resampled = [];
+			for (let i = 0; i < targetRows; i++) {
+				resampled[i] = [];
+				// 対応する元の行の位置（小数点も含む）
+				const srcI = Math.floor(i * sourceRows / targetRows);
+				for (let j = 0; j < targetCols; j++) {
+				const srcJ = Math.floor(j * sourceCols / targetCols);
+				resampled[i][j] = matrix[srcI][srcJ];
+				}
+			}
+			return resampled;
+		}
+
+		function drawMatrixOnCanvas(matrix, canvasId, resolution, contrast = 1) {
+			// 希望の表示サイズ
+			const desiredWidth = resolution[0];
+			const desiredHeight = resolution[1];
+			
+			const rows = matrix.length;
+			const cols = matrix[0].length;
+			const canvas = document.getElementById(canvasId);
+			canvas.width = desiredWidth;
+			canvas.height = desiredHeight;
+			const ctx = canvas.getContext("2d");
+			
+			// オフスクリーンcanvasは再サンプリング後のサイズに合わせる
+			const offCanvas = document.createElement("canvas");
+			offCanvas.width = cols;
+			offCanvas.height = rows;
+			const offCtx = offCanvas.getContext("2d");
+			
+			// ImageDataの作成
+			const imageData = offCtx.createImageData(cols, rows);
+			
+			// 行列の最小値・最大値を求める
+			let minVal = Infinity, maxVal = -Infinity;
+			for (let i = 0; i < rows; i++) {
+				for (let j = 0; j < cols; j++) {
+				const value = matrix[i][j];
+				if (value < minVal) minVal = value;
+				if (value > maxVal) maxVal = value;
+				}
+			}
+			if (maxVal === minVal) maxVal = minVal + 1;
+			
+			// ImageDataに画素値を設定（グレースケール）
+			// 各画素値を0～1に正規化した後、コントラスト調整を適用
+			for (let i = 0; i < rows; i++) {
+				for (let j = 0; j < cols; j++) {
+				// 0～1に正規化
+				const normalized = (matrix[i][j] - minVal) / (maxVal - minVal);
+				// コントラスト調整（中心値0.5を基準）
+				let adjusted = (normalized - 0.5) * contrast + 0.5;
+				adjusted = Math.max(0, Math.min(1, adjusted));  // 0～1にクランプ
+				const norm = Math.floor(adjusted * 255);
+				
+				const index = (i * cols + j) * 4;
+				imageData.data[index]     = norm; // red
+				imageData.data[index + 1] = norm; // green
+				imageData.data[index + 2] = norm; // blue
+				imageData.data[index + 3] = 255;  // alpha
+				}
+			}
+			
+			offCtx.putImageData(imageData, 0, 0);
+			
+			// offCanvas と表示サイズが異なる場合、scale を使って描画
+			const scaleX = desiredWidth / cols;
+			const scaleY = desiredHeight / rows;
+			ctx.scale(scaleX, scaleY);
+			ctx.drawImage(offCanvas, 0, 0);
+			ctx.setTransform(1, 0, 0, 1, 0, 0);
+			}
+
+
+		// 1次元配列を2次元配列に変換する関数
+		function flatToMatrix(flatArray, rows, cols) {
+			const matrix = [];
+			for (let i = 0; i < rows; i++) {
+				matrix.push(flatArray.slice(i * cols, (i + 1) * cols));
+			}
+			return matrix;
+		}
+
+		function replaceNullWithZero(matrix) {
+			for (let i = 0; i < matrix.length; i++) {
+				for (let j = 0; j < matrix[i].length; j++) {
+					if (matrix[i][j] === null) {
+						matrix[i][j] = 0;
+					}
+				}
+			}
+			return matrix;
+		}
+
+		function invertMatrix(matrix) {
+			let minVal = Infinity;
+			let maxVal = -Infinity;
+			// 最小値・最大値の算出
+			for (let i = 0; i < matrix.length; i++) {
+				for (let j = 0; j < matrix[i].length; j++) {
+					if (matrix[i][j] !== null) {
+						if (matrix[i][j] < minVal) minVal = matrix[i][j];
+						if (matrix[i][j] > maxVal) maxVal = matrix[i][j];
+					}
+				}
+			}
+			
+			// 各要素を反転
+			const inverted = [];
+			for (let i = 0; i < matrix.length; i++) {
+				inverted[i] = [];
+				for (let j = 0; j < matrix[i].length; j++) {
+					if (matrix[i][j] !== null) {
+						inverted[i][j] = maxVal + minVal - matrix[i][j];
+					} else {
+						inverted[i][j] = null;
+					}
+				}
+			}
+			return inverted;
+		}
+
+		function normalizeDEM(dem, contrast = 1) {
+			const rows = dem.length;
+			const cols = dem[0].length;
+			
+			let minVal = Infinity;
+			let maxVal = -Infinity;
+			
+			// DEM全体の最小値と最大値を求める
+			for (let i = 0; i < rows; i++) {
+				for (let j = 0; j < cols; j++) {
+				const value = dem[i][j];
+				if (value < minVal) minVal = value;
+				if (value > maxVal) maxVal = value;
+				}
+			}
+			
+			// 全ての値が同じ場合は、全体を0として返す
+			if (maxVal === minVal) {
+				return dem.map(row => row.map(() => 0));
+			}
+			
+			// 正規化とコントラスト調整を行う
+			const normalized = [];
+			for (let i = 0; i < rows; i++) {
+				normalized[i] = [];
+				for (let j = 0; j < cols; j++) {
+				// 0～1に正規化
+				let value = (dem[i][j] - minVal) / (maxVal - minVal);
+				// コントラスト調整（例：contrast = 0.5 ならコントラストが50%）
+				value = (value - 0.5) * contrast + 0.5;
+				// 結果を0～1にクランプ
+				value = Math.min(Math.max(value, 0), 1);
+				normalized[i][j] = value;
+				}
+			}
+			return normalized;
+		}
+
+
+
+		// JAXAのAPIを利用するためのスクリプト
+		import * as je from "https://data.earth.jaxa.jp/api/javascript/v1.2.3/jaxa.earth.esm.js";
+
+		//const jelayer0 = await je.ol.createLayer({
+		//	ol,
+		//	collection: "https://s3.ap-northeast-1.wasabisys.com/je-pds/cog/v1/JAXA.EORC_ALOS.PRISM_AW3D30.v3.2_global/collection.json",
+		//	band: "DSM",
+		//	colorMap: {
+		//		min: 0,
+		//		max: 6000,
+		//		colors: "jet",
+		//	},
+		//	//バイリニアリサンプリングを使用(未指定時は高速なニアレストネイバーを使用)
+		//	// bilinearResampling: true,
+		//});
+
+		//凡例を表示
+		//document.body.appendChild(jelayer0.getLegend(300, 20, 10));
+
+		//OpenLayersを作成
+		const projection = "EPSG:4326";
+		const map = new ol.Map({
+			target: "map",
+			pixelRatio: 1,
+
+			layers: [
+				new ol.layer.Tile({
+					// source: new ol.source.OSM(),
+					source: new ol.source.XYZ({
+						//https://maps.gsi.go.jp/development/ichiran.html
+						//url: "https://cyberjapandata.gsi.go.jp/xyz/std/{z}/{x}/{y}.png",
+						url: "https://mt1.google.com/vt/lyrs=y&x={x}&y={y}&z={z}",
+						crossOrigin: 'anonymous',
+					}),
+				}),
+				//作成したレイヤーを追加
+				//jelayer0,
+			],
+
+			view: new ol.View({
+				//全世界を初期位置にする場合
+				//center: ol.proj.fromLonLat([0, 0], projection),
+				//zoom: 0,
+
+				//日本周辺を初期位置にする場合
+				center: ol.proj.fromLonLat([138, 36], projection),
+				zoom: 5,
+			
+				//投影法(必須)
+				projection,
+
+				//スクロール範囲を制限する場合
+				// extent: [-360,-90,360,90],
+			}),
+			
+		});
+
+		// カスタムスケールバーのコントロールを定義
+		class ScaleBarControl extends ol.control.Control {
+			constructor(options = {}) {
+				// スケールバー表示用のdivを作成し、スタイルを設定
+				const element = document.createElement('div');
+				element.className = 'ol-scale-bar';
+				element.style.cssText = 'position: absolute; bottom: 10px; left: 10px; background: rgba(255,255,255,0.7); padding: 5px; font-size: 12px;';
+				super({ element: element, target: options.target });
+			}
+
+			// マップが設定されたときにイベントを登録
+			setMap(map) {
+				super.setMap(map);
+				if (map) {
+				this.updateScale();
+				// 地図の移動完了時や解像度変更時にスケールバーを更新
+				map.on('moveend', this.updateScale.bind(this));
+				map.on('change:resolution', this.updateScale.bind(this));
+				}
+			}
+
+			// 現在の解像度・中心位置からスケールバーを更新する関数
+			updateScale() {
+				const view = this.getMap().getView();
+				const resolution = view.getResolution();
+				const center = view.getCenter();
+				// 現在の中心の緯度から、経度方向の1度あたりの距離（おおよそ）を計算（単位: m）
+				const lat = center[1] * Math.PI / 180;
+				const metersPerDegree = 111320 * Math.cos(lat);
+				// 1ピクセルあたりの地上距離（m）
+				const metersPerPixel = resolution * metersPerDegree;
+
+				// マップ幅の1/5程度の長さをスケールバーの最大幅として設定
+				const mapSize = this.getMap().getSize();
+				const maxBarWidth = mapSize[0] / 5;
+				let maxDistance = maxBarWidth * metersPerPixel;
+
+				// 「1, 2, 5の倍数」を使ってスケールバーの距離を丸める（例: 100 m, 200 m, 500 m, 1000 m, ...）
+				const exponent = Math.floor(Math.log10(maxDistance));
+				const base = Math.pow(10, exponent);
+				let scaleDistance;
+				if (maxDistance / base < 1.5) {
+				scaleDistance = 1 * base;
+				} else if (maxDistance / base < 3) {
+				scaleDistance = 2 * base;
+				} else if (maxDistance / base < 7) {
+				scaleDistance = 5 * base;
+				} else {
+				scaleDistance = 10 * base;
+				}
+
+				// 計算したスケール距離をピクセルに換算
+				const barPixelLength = scaleDistance / metersPerPixel;
+				let displayValue;
+				if (scaleDistance >= 1000) {
+				displayValue = (scaleDistance / 1000).toFixed(1) + ' km';
+				} else {
+				displayValue = Math.round(scaleDistance) + ' m';
+				}
+				// スケールバーの見た目を更新（横線とラベル）
+				this.element.innerHTML = '<div style="width:' + barPixelLength + 'px; border-top:2px solid black;"></div>' +
+										'<div>' + displayValue + '</div>';
+			}
+		}
+		// 既存のマップ生成後のコードに、スケールバーコントロールを追加
+		map.addControl(new ScaleBarControl());
+
+		//クリックした場所の値を取得する
+		map.on("click", async e => {
+			//クリックした位置のピクセル座標(div#mapの左上が(0,0)、右下が(width-1,height-1))
+			const [i, j] = e.pixel;
+
+			const image = jelayer0.getImage();
+
+			if (image.ready()) {
+				//読み込みが完了している場合
+
+				//クリックした場所の緯度経度
+				const { longitude, latitude } = image.getCoordinates(i, j);
+
+				//クリックした場所の値
+				const value = image.getValue(i, j);
+
+				//データの単位
+				const unit = image.getUnit();
+
+				alert(JSON.stringify({
+					longitude,
+					latitude,
+					value,
+					unit,
+				}, null, "  "));
+
+			} else {
+				//読み込み中の場合
+				alert("読み込み完了までお待ちください");
+			}
+		});
+
+		const jelayer1 = await je.ol.createLayer({
+			//OpenLayersのオブジェクトを渡す。詳細は上記の【olオブジェクトについて】を参照。
+			ol,
+			collection: "https://s3.ap-northeast-1.wasabisys.com/je-pds/cog/v1/JAXA.EORC_ALOS.PRISM_AW3D30.v3.2_global/collection.json",
+			band: "DSM",		//省略時は1個目のバンドを表示
+			colorMap: {
+				min: 0,
+				max: 6000,
+				colors: "ic",
+			},
+			//バイリニアリサンプリングを使用(未指定時は高速なニアレストネイバーを使用)
+			bilinearResampling: true,
+		});
+
+		const image = await je.getImage({
+			//利用するデータセットのcollection.jsonのURLを記載します。
+			collection: "https://s3.ap-northeast-1.wasabisys.com/je-pds/cog/v1/JAXA.EORC_ALOS.PRISM_AW3D30.v3.2_global/collection.json",
+
+			//利用するデータセットのバンドを指定します。
+			band: "DSM",
+
+			//データを取得する緯度経度範囲を記載します。
+			//[最小経度(東), 最小緯度(南), 最大経度(東), 最大緯度(北)]
+			bbox: [90, -90, 180, 90],
+
+			//データを取得する画像のサイズをピクセル数で記載します。
+			width: 500,
+			height: 800,
+
+			//可視化用のカラーマップを指定します。
+			colorMap: {
+				//最小値
+				min: 0,
+				//最大値
+				max: 6000,
+				//最小値～最大値をjet（青～緑～黄～赤の虹色）で塗りつぶします。
+				colors: "jet"
+			},
+			//バイリニアリサンプリングを使用(未指定時は高速なニアレストネイバーを使用)
+			bilinearResampling: true
+		});
+
+		var map0_resolution = map.getSize();
+		const extent = map.getView().calculateExtent(map0_resolution);
+		// 取得した extent を bbox に指定して下の画像を再取得
+		const newImage = await je.getImage({
+			collection: "https://s3.ap-northeast-1.wasabisys.com/je-pds/cog/v1/JAXA.EORC_ALOS.PRISM_AW3D30.v3.2_global/collection.json",
+			band: "DSM",
+			bbox: extent,
+			width: Math.round(map0_resolution[0]),
+			height: Math.round(map0_resolution[1]),
+			colorMap: {
+				min: 0,
+				max: 6000,
+				colors: "jet"
+			},
+			//バイリニアリサンプリングを使用(未指定時は高速なニアレストネイバーを使用)
+			bilinearResampling: true
+		});
+		
+		// 右側の陰影図を更新する共通関数
+		async function updateShadowMap() {
+			const mapSize = map.getSize();
+			const extent = map.getView().calculateExtent(mapSize);
+			
+			// DEMデータ（画像）を取得
+			const newImage = await je.getImage({
+				collection: "https://s3.ap-northeast-1.wasabisys.com/je-pds/cog/v1/JAXA.EORC_ALOS.PRISM_AW3D30.v3.2_global/collection.json",
+				band: "DSM",
+				bbox: extent,
+				width: Math.round(mapSize[0]),
+				height: Math.round(mapSize[1]),
+				colorMap: {
+				min: 0,
+				max: 6000,
+				colors: "jet"
+				},
+				bilinearResampling: true
+			});
+			
+			const data = newImage.getData();
+			const demMatrix = flatToMatrix(data.data, Math.round(mapSize[1]), Math.round(mapSize[0]));
+			const data_cleaned = replaceNullWithZero(demMatrix);
+			
+			// 選択されている陰影図の種類を取得
+			const shadowType = document.querySelector('input[name="shadowType"]:checked').value;
+			let data_final;
+			
+			if (shadowType === "combined") {
+				// Combined: Ridge/Valley DegreeとHillshadeの乗算（正規化済み）
+				const data_hs = calculateHillshade(data_cleaned, 30, 315, 45);
+				const data_to = calculateTopographicOpenness(data_cleaned, 30, 3, 8);
+				const data_rvd = calculateRidgeValleyDegreeFromOpenness(data_to.upper, data_to.lower);
+				data_final = multiplyMatrices(normalizeDEM(data_rvd, 1), normalizeDEM(data_hs, 0.2));
+				drawMatrixOnCanvas(data_final, 'lowerMapCanvas', mapSize, 1.6);
+			} else if (shadowType === "hillshade") {
+				// Hillshadeのみ
+				data_final = calculateHillshade(data_cleaned, 30, 315, 45);
+				drawMatrixOnCanvas(data_final, 'lowerMapCanvas', mapSize, 1);
+			} else if (shadowType === "ambient") {
+				// Ambient Occlusion
+				data_final = calculateAmbientOcclusion(data_cleaned, 30, 8, 8);
+				drawMatrixOnCanvas(data_final, 'lowerMapCanvas', mapSize, 1);
+			} else if (shadowType === "slope") {
+				// Slope（逆転させることで陰影感を出す）
+				data_final = invertMatrix(calculateSlope(data_cleaned, 30));
+				drawMatrixOnCanvas(data_final, 'lowerMapCanvas', mapSize, 1);
+			} else if (shadowType === "openness") {
+				// Topographic Openness（upper openness）
+				const data_to = calculateTopographicOpenness(data_cleaned, 30, 3, 8);
+				data_final = data_to.upper;
+				drawMatrixOnCanvas(data_final, 'lowerMapCanvas', mapSize, 1.6);
+			}			
+		}
+
+
+		// マップの描画完了時および移動終了時に更新
+		if (document.readyState === 'complete') {
+			// すでにロード済みなら、2秒後に実行
+			setTimeout(() => updateShadowMap(), 1000);
+			} else {
+			window.addEventListener('load', () => {
+				setTimeout(() => updateShadowMap(), 1000);
+			});
+		}
+
+		//map.once('rendercomplete', updateShadowMap);
+		map.on('moveend', updateShadowMap);
+
+		// ラジオボタンの変更時にも更新を実施
+		document.querySelectorAll('input[name="shadowType"]').forEach(function(radio) {
+			radio.addEventListener('change', updateShadowMap);
+		});
+
+	</script>
+</body>
+</html>
